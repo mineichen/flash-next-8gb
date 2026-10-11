@@ -346,7 +346,7 @@ def main():
     args = p.parse_args()
 
     model, config, cache, tokenizer = common.load(args)
-    STATE.update(gen=common.make_generator(model, cache, tokenizer, args),
+    STATE.update(gen=common.make_generator(model, cache, tokenizer),
                  tokenizer=tokenizer, model_dir=args.model_dir, alias=args.alias)
     STATE["gen"].generate("Hello", max_new_tokens=8)
     common.memory_report(cache, STATE["gen"])

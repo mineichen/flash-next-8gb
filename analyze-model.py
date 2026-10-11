@@ -87,12 +87,70 @@ def report(model_dir, arena=None, table=None):
     return 0
 
 
+def remote_report():
+    """Ask HuggingFace how big each published quant is, without downloading any of it.
+
+    File sizes come from the repo metadata, so this costs one API call per revision
+    and settles a 60 GB download on whether the n-gram table would actually fit.
+    """
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        print("  huggingface_hub is not installed -- run this from the project venv:")
+        print("    ~/.local/share/qwen38/venv/bin/python analyze-model.py --remote")
+        return
+
+    repo = "turboderp/Qwen3.8-Flash-Next-exl3"
+    api = HfApi()
+    ram = mem_total()
+    try:
+        refs = [b.name for b in api.list_repo_refs(repo).branches]
+    except Exception as e:
+        print(f"  could not list revisions: {e}")
+        return
+
+    print(f"  {'revision':22} {'total':>9} {'table':>9} {'arena':>9} {'spare':>9}   verdict")
+    for rev in sorted(refs):
+        try:
+            info = api.model_info(repo, revision=rev, files_metadata=True)
+        except Exception as e:
+            print(f"  {rev:22}   (skipped: {type(e).__name__})")
+            continue
+        table = sum(f.size or 0 for f in info.siblings if "ngram" in f.rfilename)
+        total = sum(f.size or 0 for f in info.siblings
+                    if f.rfilename.endswith(".safetensors"))
+        arena = total - table
+        if not table or not arena:
+            continue
+        spare = ram - arena
+        if table <= spare:
+            verdict = f"FITS, {gb(spare - table):.1f} GB spare"
+        else:
+            verdict = f"{100 * (1 - spare / table):.0f}% of reads miss"
+        print(f"  {rev:22} {gb(total):8.1f}G {gb(table):8.1f}G "
+              f"{gb(arena):8.1f}G {gb(spare):8.1f}G   {verdict}")
+    print()
+    print("  'spare' is RAM left for page cache once the arena is resident. The OS needs")
+    print("  a few GB of that, so anything under ~6 GB spare is a marginal fit, not a safe one.")
+
+
 def main():
     p = argparse.ArgumentParser(description="Flash-Next -- does the n-gram table fit in RAM?")
-    p.add_argument("-m", "--model_dir", required=True)
+    p.add_argument("-m", "--model_dir")
+    p.add_argument("--remote", action="store_true",
+                   help="compare every published quant by size; downloads nothing")
     p.add_argument("--table-gb", type=float, help="override: model the table at this size")
     p.add_argument("--arena-gb", type=float, help="override: model the arena at this size")
     args = p.parse_args()
+
+    if args.remote:
+        print("Flash-Next RAM budget -- published quants")
+        print()
+        remote_report()
+        return
+    if not args.model_dir:
+        p.error("-m/--model_dir is required unless --remote is given")
+
     t = int(args.table_gb * 2 ** 30) if args.table_gb else None
     a = int(args.arena_gb * 2 ** 30) if args.arena_gb else None
     print("Flash-Next RAM budget")

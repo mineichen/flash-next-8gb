@@ -3,3 +3,4 @@ __pycache__/
 *.safetensors
 *.gguf
 Qwen3.8-Flash-Next-*/
+log.txt

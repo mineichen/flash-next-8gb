@@ -114,8 +114,8 @@ All three take the same flags. The ones that matter:
 | flag | default | why |
 |---|---:|---|
 | `-mcl 64` | `64` (forced) | routed experts on the CPU. **This is the flag that makes it fit.** Without it ExLlamaV3 wants ~52 GB of VRAM. `common.load` sets it for you if you don't pass one |
-| `-cs` | `16384` | KV cache size in tokens — the context ceiling. See below for what it actually costs |
-| `-chunk_size` | `512` | Tokens per prefill forward pass. See below |
+| `-cs` | *engine default* | KV cache size in tokens — the context ceiling. See below for what it actually costs |
+| `-chunk_size` | *engine default* | Tokens per prefill forward pass. Lower it only if prefill OOMs |
 | `-cq` | *off* | 8-bit KV cache. **Not usable on ExLlamaV3 1.4.5** — this model has a QSA indexer whose cache layer is fp16-only there. Worth it (it halves the cache) if you move to a build with `CacheLayer_qsa_quant` |
 | *(no `-ngr`)* | — | leaving `--ngram_ram` **off** is what keeps the table on disk. Turn it on only if you have ~35 GB of RAM to spare and want to skip the reads |
 
@@ -160,11 +160,10 @@ actually fills an 8 GB card is the dense path — and because that is **fixed**,
 buffer". At ExLlamaV3's default chunk of 2048, the PLE stream buffer alone is 40 MiB, and a card
 sitting at 34 MiB free dies on it.
 
-Lowering `-chunk_size` is close to free, which is the part worth knowing: the experts run on the CPU
-at ~30–60 ms/token, so a 512-token chunk is already ~30 s of work and kernel-launch overhead never
-appears. The `-chunk_size` flag configures both the load-time warmup and the Generator's runtime
-prefill chunking; the latter used to be hardcoded at 2048 regardless of the flag, which is why this
-matters.
+Cache size does **not** move decode speed. Measured at `-cs 4096` and `-cs 20480` on the same box:
+3.82 vs 3.81 tok/s, 262.0 vs 262.2 ms inter-token latency. The 5x larger cache cost 514 MiB of VRAM
+headroom and bought nothing, which is what the bandwidth argument above predicts — decode reads the
+expert arena, not the KV cache. Size `-cs` for the conversation you want, not for speed.
 
 ## Notes from building this
 

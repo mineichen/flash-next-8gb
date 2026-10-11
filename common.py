@@ -4,42 +4,16 @@ import argparse, json, os
 # FLASH_THINK=0 turns thinking off. Only has an effect if the chat template honours enable_thinking.
 THINK = os.environ.get("FLASH_THINK", "1") != "0"
 
-# KV cache size in tokens. Only the cache scales with context, and in this model it is unusually
-# cheap: 36 of the 48 layers are linear attention with fixed-size recurrent state, so they cost the
-# same at 1 token as at 100k. The 12 real attention layers use 2 KV heads at head_dim 256, which is
-# ~24 KiB/token in fp16. Sized to leave room for the prefill scratch on a fully loaded 8 GB card;
-# raise it with -cs once the startup report shows how much VRAM is actually free.
-DEFAULT_CACHE_SIZE = int(os.environ.get("QWEN_CACHE_SIZE", 16384))
-
-# Max tokens per prefill forward pass; every activation in that pass is sized by it. Lowering it is
-# nearly free here, which is the point: the routed experts run on the CPU at ~30-60 ms/token, so a
-# 512-token chunk is already ~30 s of work and kernel-launch overhead never shows up. At the
-# ExLlamaV3 default of 2048 the PLE stream buffer alone is 40 MiB, and that is what OOMs a
-# fully-loaded 8 GB card during prefill.
-DEFAULT_CHUNK_SIZE = int(os.environ.get("QWEN_CHUNK_SIZE", 512))
-
-# Off by default, and on ExLlamaV3 1.4.5 it cannot be turned on: this model has a QSA indexer, and
-# 1.4.5's QSA cache layer is fp16-only (it asserts, in Attention.cache_layer_type). Master added
-# CacheLayer_qsa_quant, which would halve this term. Leave empty until you are on a build that has it.
-DEFAULT_CACHE_QUANT = os.environ.get("QWEN_CACHE_QUANT", "")
-
 
 def add_common_args(parser):
-    """The flags every script here takes. `-mcl` is the one that makes it fit."""
-    import inspect
+    """The flags every script here takes. `-mcl` is the one that makes it fit.
+
+    Deliberately bare: no default_cache_size, no default_chunk_size. Every value handed to
+    ExLlamaV3 here is one fewer variable between the model and the engine's own defaults, and
+    nothing measured has earned the right to override one.
+    """
     from exllamav3 import model_init
-
-    # ExLlamaV3 1.4.5 accepts default_cache_size but not default_chunk_size (that one is master-only),
-    # so ask the function what it takes rather than what we happen to have read.
-    supported = inspect.signature(model_init.add_args).parameters
-    want = {"add_draft_model_args": True,
-            "default_cache_size": DEFAULT_CACHE_SIZE,
-            "default_chunk_size": DEFAULT_CHUNK_SIZE}
-    model_init.add_args(parser, **{k: v for k, v in want.items() if k in supported})
-
-    # Set these directly so they hold whether or not add_args grew a knob for them: make_generator reads
-    # args.chunk_size, and this is what keeps prefill from falling back to ExLlamaV3's 2048.
-    parser.set_defaults(cache_quant=DEFAULT_CACHE_QUANT, chunk_size=DEFAULT_CHUNK_SIZE)
+    model_init.add_args(parser, add_draft_model_args=True)
     return parser
 
 
@@ -63,33 +37,23 @@ def load(args):
         if "fp16 cache layer" in str(e):
             raise AssertionError(
                 f"{e}\nThis model has a QSA (sparse) attention indexer, and the QSA cache layer is "
-                f"fp16-only in this ExLlamaV3 build. Drop -cq (or set QWEN_CACHE_QUANT=). Newer builds "
+                f"fp16-only in this ExLlamaV3 build. Drop -cq (or leave it unset). Newer builds "
                 f"add CacheLayer_qsa_quant, which would halve the KV cache."
             ) from e
         raise
     return res[0], res[1], res[2], res[3]
 
 
-def make_generator(model, cache, tokenizer, args=None):
-    """Build the generator, forwarding the knobs the CLI already exposes.
+def make_generator(model, cache, tokenizer):
+    """Build the generator on the engine's own defaults.
 
-    ExLlamaV3's Generator defaults to max_chunk_size 2048 and takes no CPU cache tier, so without
-    this the `-cs`/`-ccs`/`-chunk_size` flags only half-reach the runtime: prefill chunks at 2048
-    and allocates from the GPU whatever it should have kept in system RAM.
+    This used to forward `max_chunk_size`, `cpu_cache_size` and `recurrent_cache_size`, on the
+    theory that smaller chunks and a CPU-side recurrent state would be faster. That was never
+    measured, and the one thing that was measured came back unchanged, so it is gone. Pass `-cs`
+    or `-chunk_size` on the command line if you want to experiment; do not bury it here.
     """
-    import inspect
     from exllamav3.generator import Generator
-
-    want = {}
-    if args is not None:
-        want["max_chunk_size"] = getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE)
-        want["cpu_cache_size"] = int(float(getattr(args, "cpu_cache_size", 0) or 0) * 1024 ** 3)
-        want["recurrent_cache_size"] = int(float(getattr(args, "recurrent_cache_size", 4.0) or 0) * 1024 ** 3)
-
-    # Older ExLlamaV3 builds lack some of these; passing them anyway is a TypeError at startup.
-    have = inspect.signature(Generator.__init__).parameters
-    want = {k: v for k, v in want.items() if k in have}
-    return Generator(model=model, cache=cache, tokenizer=tokenizer, **want)
+    return Generator(model=model, cache=cache, tokenizer=tokenizer)
 
 
 def _child_pids(pid):
@@ -132,9 +96,15 @@ def hugepage_report():
                         huge += int(line.split()[1])
         except (OSError, ValueError, IndexError):
             pass
-    if anon <= 0:
-        return
+    # smaps_rollup reports kB; everything below this function thinks in bytes. An earlier
+    # version compared the raw kB total against a byte threshold, which made the guard trip
+    # at 1 TiB instead of 1 GiB -- so the report never printed once, on any machine.
+    anon, huge = anon * 1024, huge * 1024
     gib = 2 ** 30
+    if anon <= 0:
+        print(f"  hugepages  could not read smaps_rollup for {len(pids)} process(es) "
+              f"({', '.join(map(str, pids))}) -- this number is unknown, not fine", flush=True)
+        return
     # Only meaningful once the model is actually resident; a few MiB of interpreter
     # anonymous memory would otherwise trip the warning on every single start.
     if anon < gib:
@@ -143,10 +113,17 @@ def hugepage_report():
     print(f"  hugepages  {huge / gib:.1f} of {anon / gib:.1f} GiB in 2 MiB pages  ({pct}%)",
           flush=True)
     if pct < 20:
-        print(f"             ^^ only {pct}%. If decode is CPU-bound, this is why: scattered 4 KiB "
-              f"reads over ~58 GB miss the TLB on almost every access.", flush=True)
-        print("             Try, before starting the server:  sudo sysctl -w vm.drop_caches=3",
+        print("             ^^ only {pct}%. If decode is CPU-bound, this is why: scattered 4 KiB "
+              "reads over ~58 GB miss the TLB on almost every access.".format(pct=pct), flush=True)
+        print("             Fix, BEFORE starting the server:", flush=True)
+        print("               echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled",
               flush=True)
+        print("               echo always | sudo tee /sys/kernel/mm/transparent_hugepage/defrag",
+              flush=True)
+        print("               sudo swapoff -a && sudo sysctl -w vm.drop_caches=3", flush=True)
+        print("             swapoff MUST precede drop_caches: with swap on, dropping caches just",
+              flush=True)
+        print("             pushes the arena into swap and collapse fails again.", flush=True)
 
 
 def memory_report(cache, gen=None):

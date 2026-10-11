@@ -37,7 +37,7 @@ def main():
     print(f"load: {time.time()-t0:.1f} s", flush=True)
 
     from exllamav3.generator import Job
-    gen = common.make_generator(model, cache, tokenizer, args)
+    gen = common.make_generator(model, cache, tokenizer)
     gen.generate("Hello", max_new_tokens=8)          # warm the kernels
 
     common.memory_report(cache, gen)
