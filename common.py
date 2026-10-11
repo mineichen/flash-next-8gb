@@ -24,11 +24,20 @@ DEFAULT_CACHE_QUANT = os.environ.get("QWEN_CACHE_QUANT", "8,8")
 
 def add_common_args(parser):
     """The flags every script here takes. `-mcl` is the one that makes it fit."""
+    import inspect
     from exllamav3 import model_init
-    model_init.add_args(parser, add_draft_model_args=True,
-                        default_cache_size=DEFAULT_CACHE_SIZE,
-                        default_chunk_size=DEFAULT_CHUNK_SIZE)
-    parser.set_defaults(cache_quant=DEFAULT_CACHE_QUANT)
+
+    # ExLlamaV3 1.4.5 accepts default_cache_size but not default_chunk_size (that one is master-only),
+    # so ask the function what it takes rather than what we happen to have read.
+    supported = inspect.signature(model_init.add_args).parameters
+    want = {"add_draft_model_args": True,
+            "default_cache_size": DEFAULT_CACHE_SIZE,
+            "default_chunk_size": DEFAULT_CHUNK_SIZE}
+    model_init.add_args(parser, **{k: v for k, v in want.items() if k in supported})
+
+    # Set these directly so they hold whether or not add_args grew a knob for them: make_generator reads
+    # args.chunk_size, and this is what keeps prefill from falling back to ExLlamaV3's 2048.
+    parser.set_defaults(cache_quant=DEFAULT_CACHE_QUANT, chunk_size=DEFAULT_CHUNK_SIZE)
     return parser
 
 
