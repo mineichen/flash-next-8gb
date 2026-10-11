@@ -6,9 +6,10 @@ THINK = os.environ.get("FLASH_THINK", "1") != "0"
 
 # KV cache size in tokens. Only the cache scales with context, and in this model it is unusually
 # cheap: 36 of the 48 layers are linear attention with fixed-size recurrent state, so they cost the
-# same at 1 token as at 100k. The 12 real attention layers use 2 KV heads at head_dim 256, which
-# is ~24 KiB/token in fp16 and ~12 KiB/token at -cq 8,8.
-DEFAULT_CACHE_SIZE = int(os.environ.get("QWEN_CACHE_SIZE", 32768))
+# same at 1 token as at 100k. The 12 real attention layers use 2 KV heads at head_dim 256, which is
+# ~24 KiB/token in fp16. Sized to leave room for the prefill scratch on a fully loaded 8 GB card;
+# raise it with -cs once the startup report shows how much VRAM is actually free.
+DEFAULT_CACHE_SIZE = int(os.environ.get("QWEN_CACHE_SIZE", 16384))
 
 # Max tokens per prefill forward pass; every activation in that pass is sized by it. Lowering it is
 # nearly free here, which is the point: the routed experts run on the CPU at ~30-60 ms/token, so a
@@ -17,9 +18,10 @@ DEFAULT_CACHE_SIZE = int(os.environ.get("QWEN_CACHE_SIZE", 32768))
 # fully-loaded 8 GB card during prefill.
 DEFAULT_CHUNK_SIZE = int(os.environ.get("QWEN_CHUNK_SIZE", 512))
 
-# 8-bit keys and values. Halves the only term that grows with context; next to a 3.05 bpw body the
-# quality change is not measurable. Pass -cq fp16 to turn it back off.
-DEFAULT_CACHE_QUANT = os.environ.get("QWEN_CACHE_QUANT", "8,8")
+# Off by default, and on ExLlamaV3 1.4.5 it cannot be turned on: this model has a QSA indexer, and
+# 1.4.5's QSA cache layer is fp16-only (it asserts, in Attention.cache_layer_type). Master added
+# CacheLayer_qsa_quant, which would halve this term. Leave empty until you are on a build that has it.
+DEFAULT_CACHE_QUANT = os.environ.get("QWEN_CACHE_QUANT", "")
 
 
 def add_common_args(parser):
@@ -55,7 +57,16 @@ def load(args):
     if not getattr(args, "moe_cpu_offload", 0):
         args.moe_cpu_offload = 64          # every MoE layer's experts to system RAM
     args.cache_quant = _cache_quant(getattr(args, "cache_quant", None))
-    res = model_init.init(args)
+    try:
+        res = model_init.init(args)
+    except AssertionError as e:
+        if "fp16 cache layer" in str(e):
+            raise AssertionError(
+                f"{e}\nThis model has a QSA (sparse) attention indexer, and the QSA cache layer is "
+                f"fp16-only in this ExLlamaV3 build. Drop -cq (or set QWEN_CACHE_QUANT=). Newer builds "
+                f"add CacheLayer_qsa_quant, which would halve the KV cache."
+            ) from e
+        raise
     return res[0], res[1], res[2], res[3]
 
 

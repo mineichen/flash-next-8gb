@@ -26,11 +26,10 @@ turboderp's `3.05bpw` quant:
 | decode, Japanese | 35.5 tok/s |
 | perplexity (wikitext-2, 2048 × 20) | 3.6209 |
 
-That run used **fp16 KV at `-cs 4096`**, which is the cheapest configuration there is. The scripts
-now default to a 8-bit KV cache and a much larger `-cs`, so your numbers will not match this table
-until you pass the old settings explicitly. An 8 GB card has ~7.7 GB usable headless. Attach a
-monitor and you lose 0.3–0.8 GB of that — on a fully loaded card that margin is the difference
-between serving and an OOM, which is where it goes.
+That run used **fp16 KV at `-cs 4096`**, which is the cheapest configuration there is. The scripts now
+default to a larger `-cs`, so your VRAM will not match this table — pass `-cs 4096` to reproduce it.
+An 8 GB card has ~7.7 GB usable headless. Attach a monitor and you lose 0.3–0.8 GB of that — on a
+fully loaded card that margin is the difference between serving and an OOM, which is where it goes.
 
 **Expect a laptop to be slower, and do not trust our number as yours.** The table above came off a
 64-core Threadripper with AVX-512, 1 TB of RAM and an Optane SSD. Every one of those helps, and a
@@ -107,7 +106,7 @@ Reproduce our numbers. The table above was measured with fp16 KV at `-cs 4096`, 
 the default, so both settings have to be passed back explicitly to land on the same numbers:
 
 ```bash
-python bench.py -m ./Qwen3.8-Flash-Next-exl3-3.05bpw -cs 4096 -cq fp16 -chunk_size 4096
+python bench.py -m ./Qwen3.8-Flash-Next-exl3-3.05bpw -cs 4096
 ```
 
 All three take the same flags. The ones that matter:
@@ -115,16 +114,16 @@ All three take the same flags. The ones that matter:
 | flag | default | why |
 |---|---:|---|
 | `-mcl 64` | `64` (forced) | routed experts on the CPU. **This is the flag that makes it fit.** Without it ExLlamaV3 wants ~52 GB of VRAM. `common.load` sets it for you if you don't pass one |
-| `-cs` | `32768` | KV cache size in tokens — the context ceiling. See below for what it actually costs |
-| `-cq` | `8,8` | 8-bit keys and values. Halves the KV cache for no measurable quality change against a 3.05 bpw body. `-cq fp16` opts back out |
+| `-cs` | `16384` | KV cache size in tokens — the context ceiling. See below for what it actually costs |
 | `-chunk_size` | `512` | Tokens per prefill forward pass. See below |
+| `-cq` | *off* | 8-bit KV cache. **Not usable on ExLlamaV3 1.4.5** — this model has a QSA indexer whose cache layer is fp16-only there. Worth it (it halves the cache) if you move to a build with `CacheLayer_qsa_quant` |
 | *(no `-ngr`)* | — | leaving `--ngram_ram` **off** is what keeps the table on disk. Turn it on only if you have ~35 GB of RAM to spare and want to skip the reads |
 
 Every script prints where the VRAM went before it starts serving (illustrative):
 
 ```
   VRAM        6452 MiB allocated, 6712 reserved, 1350 of 7803 MiB free
-  KV cache     384 MiB   12.0 KiB/token, 32768 tokens
+  KV cache     384 MiB   24.0 KiB/token, 16384 tokens
 ```
 
 That is the number to read before raising `-cs`, not a guess. `bench.py -lm` adds ExLlamaV3's
@@ -148,14 +147,14 @@ So the rule, for any client: **`limit.context + limit.output ≤ -cs`**.
 
 Only **12 of the 48 layers** are real attention. The other 36 are linear attention with fixed-size
 recurrent state — they cost the same at one token as at 100,000. Those 12 use just 2 KV heads at
-`head_dim` 256, so the entire KV cache is:
+`head_dim` 256, which makes the whole KV cache unusually cheap:
 
-| cache | per token | `-cs 8192` | `-cs 32768` |
-|---|---:|---:|---:|
-| `-cq fp16` | 24 KiB | 192 MiB | 768 MiB |
-| `-cq 8,8` (default) | 12 KiB | 96 MiB | 384 MiB |
+| cache | per token | `-cs 8192` | `-cs 16384` | `-cs 32768` |
+|---|---:|---:|---:|---:|
+| fp16 (1.4.5, the only option) | 24 KiB | 192 MiB | 384 MiB | 768 MiB |
+| `-cq 8,8` (needs a newer build) | 12 KiB | 96 MiB | 192 MiB | 384 MiB |
 
-So the cache is a small, predictable term, and 64k of context is affordable on a card this size. What
+So the cache is a small, predictable term, and long context is affordable on a card this size. What
 actually fills an 8 GB card is the dense path — and because that is **fixed**, the failure mode is not
 "the conversation got too long", it is "the card was full and prefill had nowhere to put a scratch
 buffer". At ExLlamaV3's default chunk of 2048, the PLE stream buffer alone is 40 MiB, and a card
