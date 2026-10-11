@@ -60,6 +60,10 @@ class OutOfMemory(Exception):
     """The prefill did not fit. The generator is reset before this escapes."""
 
 
+class ContextTooLong(Exception):
+    """Prompt plus the reserved generation budget does not fit the KV cache."""
+
+
 @contextlib.contextmanager
 def gpu_slot(timeout=BUSY_TIMEOUT):
     """One request at a time. Queue briefly, then tell the client to come back rather than hang."""
@@ -97,7 +101,18 @@ def generate(messages, max_new, tools=None, stream_cb=None):
     ids = tokenizer.encode(prompt, add_bos=False, encode_special_tokens=True)
     job = Job(input_ids=ids, max_new_tokens=max_new,
               stop_conditions=common.stop_conditions(tokenizer))
-    gen.enqueue(job)
+    try:
+        gen.enqueue(job)
+    except AssertionError as e:
+        # ExLlamaV3's page-table admission check. The cache has to hold the prompt AND the whole
+        # reserved generation budget at the same time, so this fires whenever prompt + max_tokens
+        # exceeds -cs -- which a client hits by trusting `limit.context` as a total rather than as
+        # a prompt budget. Say that, instead of leaking the bare assertion.
+        pin = ids.shape[-1]
+        raise ContextTooLong(
+            f"{e} — this request is {pin} prompt tokens plus {max_new} reserved for the reply, "
+            f"so -cs must be at least {pin + max_new}. Raise -cs, or lower the client's max_tokens."
+        ) from e
     out = []
     try:
         done = False
@@ -173,6 +188,8 @@ class Handler(BaseHTTPRequestHandler):
             except Busy:
                 return self._json(503, {"error": {"message": "server busy, retry shortly",
                                                   "type": "server_busy"}})
+            except ContextTooLong as e:
+                return self._json(400, {"error": {"message": str(e), "type": "context_too_long"}})
             except OutOfMemory as e:
                 return self._json(503, {"error": {"message": str(e), "type": "out_of_memory"}})
             reasoning, answer = common.split_reasoning(text)
@@ -261,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except (Busy, OutOfMemory) as e:
+        except (Busy, OutOfMemory, ContextTooLong) as e:
             self._stream_error(cid, created, type(e).__name__, str(e))
         except Exception as e:
             traceback.print_exc()
@@ -288,9 +305,10 @@ def main():
     args = p.parse_args()
 
     model, config, cache, tokenizer = common.load(args)
-    STATE.update(gen=common.make_generator(model, cache, tokenizer),
+    STATE.update(gen=common.make_generator(model, cache, tokenizer, args),
                  tokenizer=tokenizer, model_dir=args.model_dir, alias=args.alias)
     STATE["gen"].generate("Hello", max_new_tokens=8)
+    common.memory_report(cache, STATE["gen"])
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"listening on http://{args.host}:{args.port}  (model: {args.alias})", flush=True)
     srv.serve_forever()

@@ -18,8 +18,9 @@ def main():
 
     model, config, cache, tokenizer = common.load(args)
     from exllamav3.generator import Job
-    gen = common.make_generator(model, cache, tokenizer)
+    gen = common.make_generator(model, cache, tokenizer, args)
     messages = [{"role": "system", "content": args.system}]
+    common.memory_report(cache, gen)
     print("ready — Ctrl-D to quit, /reset to start over\n", flush=True)
 
     while True:

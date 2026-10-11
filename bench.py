@@ -37,8 +37,10 @@ def main():
     print(f"load: {time.time()-t0:.1f} s", flush=True)
 
     from exllamav3.generator import Job
-    gen = common.make_generator(model, cache, tokenizer)
+    gen = common.make_generator(model, cache, tokenizer, args)
     gen.generate("Hello", max_new_tokens=8)          # warm the kernels
+
+    common.memory_report(cache, gen)
 
     after = gpu_mem()
     used = {k: after[k] - before.get(k, 0) for k in after if after[k] - before.get(k, 0) > 100}

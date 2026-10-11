@@ -26,8 +26,11 @@ turboderp's `3.05bpw` quant:
 | decode, Japanese | 35.5 tok/s |
 | perplexity (wikitext-2, 2048 × 20) | 3.6209 |
 
-An 8 GB card has ~7.7 GB usable headless, so 6.62 GiB fits with room. Attach a monitor and you lose
-0.3–0.8 GB of that — still fine, but that is where the margin goes.
+That run used **fp16 KV at `-cs 4096`**, which is the cheapest configuration there is. The scripts
+now default to a 8-bit KV cache and a much larger `-cs`, so your numbers will not match this table
+until you pass the old settings explicitly. An 8 GB card has ~7.7 GB usable headless. Attach a
+monitor and you lose 0.3–0.8 GB of that — on a fully loaded card that margin is the difference
+between serving and an OOM, which is where it goes.
 
 **Expect a laptop to be slower, and do not trust our number as yours.** The table above came off a
 64-core Threadripper with AVX-512, 1 TB of RAM and an Optane SSD. Every one of those helps, and a
@@ -100,19 +103,69 @@ The model thinks before it answers. `serve.py` separates that out: the thinking 
 `reasoning_content` (streamed as `reasoning_content` deltas) and the answer as `content`, so a
 client that does not know about reasoning still shows a clean reply.
 
-Reproduce our numbers:
+Reproduce our numbers. The table above was measured with fp16 KV at `-cs 4096`, which is no longer
+the default, so both settings have to be passed back explicitly to land on the same numbers:
 
 ```bash
-python bench.py -m ./Qwen3.8-Flash-Next-exl3-3.05bpw
+python bench.py -m ./Qwen3.8-Flash-Next-exl3-3.05bpw -cs 4096 -cq fp16 -chunk_size 4096
 ```
 
 All three take the same flags. The ones that matter:
 
-| flag | why |
-|---|---|
-| `-mcl 64` | routed experts on the CPU. **This is the flag that makes it fit.** Without it ExLlamaV3 wants ~52 GB of VRAM |
-| `-cs 4096` | KV cache size in tokens. Raise it for longer context, at the cost of VRAM |
-| *(no `-ngr`)* | leaving `--ngram_ram` **off** is what keeps the table on disk. Turn it on only if you have ~35 GB of RAM to spare and want to skip the reads |
+| flag | default | why |
+|---|---:|---|
+| `-mcl 64` | `64` (forced) | routed experts on the CPU. **This is the flag that makes it fit.** Without it ExLlamaV3 wants ~52 GB of VRAM. `common.load` sets it for you if you don't pass one |
+| `-cs` | `32768` | KV cache size in tokens — the context ceiling. See below for what it actually costs |
+| `-cq` | `8,8` | 8-bit keys and values. Halves the KV cache for no measurable quality change against a 3.05 bpw body. `-cq fp16` opts back out |
+| `-chunk_size` | `512` | Tokens per prefill forward pass. See below |
+| *(no `-ngr`)* | — | leaving `--ngram_ram` **off** is what keeps the table on disk. Turn it on only if you have ~35 GB of RAM to spare and want to skip the reads |
+
+Every script prints where the VRAM went before it starts serving (illustrative):
+
+```
+  VRAM        6452 MiB allocated, 6712 reserved, 1350 of 7803 MiB free
+  KV cache     384 MiB   12.0 KiB/token, 32768 tokens
+```
+
+That is the number to read before raising `-cs`, not a guess. `bench.py -lm` adds ExLlamaV3's
+per-tensor load metrics if you want the full breakdown.
+
+### `-cs` must cover the prompt *and* the reply
+
+The cache holds the prompt and the tokens being generated at the same time, so a client whose limits
+say "16384 context, 4096 output" needs `-cs 20480` — not 16384. Most OpenAI-compatible clients treat
+`context` as the *prompt* budget and add `output` on top, and most will happily send a request that
+needs more cache than you allocated. Get it wrong and you get a `400` naming the three numbers that
+matter:
+
+```
+prompt 13312 + max_tokens 4096 needs 68 pages; -cs must be at least 17408 tokens
+```
+
+So the rule, for any client: **`limit.context + limit.output ≤ -cs`**.
+
+## Why context is cheap here, and prefill is not
+
+Only **12 of the 48 layers** are real attention. The other 36 are linear attention with fixed-size
+recurrent state — they cost the same at one token as at 100,000. Those 12 use just 2 KV heads at
+`head_dim` 256, so the entire KV cache is:
+
+| cache | per token | `-cs 8192` | `-cs 32768` |
+|---|---:|---:|---:|
+| `-cq fp16` | 24 KiB | 192 MiB | 768 MiB |
+| `-cq 8,8` (default) | 12 KiB | 96 MiB | 384 MiB |
+
+So the cache is a small, predictable term, and 64k of context is affordable on a card this size. What
+actually fills an 8 GB card is the dense path — and because that is **fixed**, the failure mode is not
+"the conversation got too long", it is "the card was full and prefill had nowhere to put a scratch
+buffer". At ExLlamaV3's default chunk of 2048, the PLE stream buffer alone is 40 MiB, and a card
+sitting at 34 MiB free dies on it.
+
+Lowering `-chunk_size` is close to free, which is the part worth knowing: the experts run on the CPU
+at ~30–60 ms/token, so a 512-token chunk is already ~30 s of work and kernel-launch overhead never
+appears. The `-chunk_size` flag configures both the load-time warmup and the Generator's runtime
+prefill chunking; the latter used to be hardcoded at 2048 regardless of the flag, which is why this
+matters.
 
 ## Notes from building this
 
