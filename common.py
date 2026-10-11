@@ -92,6 +92,63 @@ def make_generator(model, cache, tokenizer, args=None):
     return Generator(model=model, cache=cache, tokenizer=tokenizer, **want)
 
 
+def _child_pids(pid):
+    """Children of pid, read straight out of procfs (no subprocess, no pgrep dependency)."""
+    out = []
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for t in tasks:
+        try:
+            with open(f"/proc/{pid}/task/{t}/children") as f:
+                out += [int(x) for x in f.read().split()]
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def hugepage_report():
+    """Share of this process tree's memory in 2 MiB pages.
+
+    The routed experts are ~58 GB of anonymous memory read in scattered order, and they
+    live in a spawned child process rather than this one -- so the parent alone badly
+    undercounts. At 4 KiB coverage essentially every read is a TLB miss, and decode
+    runs an order of magnitude under what the memory bandwidth would allow.
+
+    ExLlamaV3 asks for MADV_COLLAPSE once after load, but it is best-effort and gives
+    up silently when memory is fragmented. So this is worth reading, not assuming.
+    """
+    pid = os.getpid()
+    pids = [pid] + _child_pids(pid) + [c for p in _child_pids(pid) for c in _child_pids(p)]
+    anon = huge = 0
+    for p in pids:
+        try:
+            with open(f"/proc/{p}/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith("Anonymous:"):
+                        anon += int(line.split()[1])
+                    elif line.startswith("AnonHugePages:"):
+                        huge += int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+    if anon <= 0:
+        return
+    gib = 2 ** 30
+    # Only meaningful once the model is actually resident; a few MiB of interpreter
+    # anonymous memory would otherwise trip the warning on every single start.
+    if anon < gib:
+        return
+    pct = huge * 100 // anon
+    print(f"  hugepages  {huge / gib:.1f} of {anon / gib:.1f} GiB in 2 MiB pages  ({pct}%)",
+          flush=True)
+    if pct < 20:
+        print(f"             ^^ only {pct}%. If decode is CPU-bound, this is why: scattered 4 KiB "
+              f"reads over ~58 GB miss the TLB on almost every access.", flush=True)
+        print("             Try, before starting the server:  sudo sysctl -w vm.drop_caches=3",
+              flush=True)
+
+
 def memory_report(cache, gen=None):
     """Print where VRAM actually went, so `-cs` can be chosen instead of guessed.
 
@@ -118,6 +175,7 @@ def memory_report(cache, gen=None):
         s = gen.get_cache_stats()
         print(f"  pages     {s['used_tokens']} used, {s['free_tokens']} free, "
               f"hit rate {s['hit_rate']}", flush=True)
+    hugepage_report()
 
 
 def _fallback_prompt(messages):
