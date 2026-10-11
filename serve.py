@@ -10,12 +10,19 @@ experts run on the CPU, so a second concurrent stream does not get you more toke
     curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \\
       -d '{"model":"flash-next","messages":[{"role":"user","content":"hello"}],"stream":true}'
 """
-import argparse, json, re, threading, time, uuid
+import argparse, contextlib, json, os, re, threading, time, traceback, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# A fully loaded 8 GB card has no slack: exllamav3 and torch fight over the last few tens of MiB during
+# prefill, and the caching allocator's default segments make that worse. Set before torch is imported.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import common
 
 STATE = {}
 LOCK = threading.Lock()
+BUSY_TIMEOUT = float(os.environ.get("SERVE_BUSY_TIMEOUT", "120"))
 
 # Qwen emits tool calls as XML; the API wants JSON objects.
 TC_OPEN = "<tool_call>"
@@ -45,6 +52,44 @@ def parse_tool_calls(text, tools):
     return calls, TC_RE.sub("", text).strip()
 
 
+class Busy(Exception):
+    """Another request already owns the model for longer than we are willing to queue."""
+
+
+class OutOfMemory(Exception):
+    """The prefill did not fit. The generator is reset before this escapes."""
+
+
+@contextlib.contextmanager
+def gpu_slot(timeout=BUSY_TIMEOUT):
+    """One request at a time. Queue briefly, then tell the client to come back rather than hang."""
+    if not LOCK.acquire(timeout=timeout):
+        raise Busy()
+    try:
+        yield
+    finally:
+        LOCK.release()
+
+
+def recover():
+    """A job that died mid-prefill can leave pages, recurrent state and queued work behind. Drop it all.
+
+    Without this the failure is sticky: the next request retries the dead job, allocates on top of the
+    stranded memory, and OOMs at exactly the same byte count, forever.
+    """
+    gen = STATE.get("gen")
+    if gen is not None:
+        try:
+            gen.clear_queue()
+        except Exception:
+            traceback.print_exc()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def generate(messages, max_new, tools=None, stream_cb=None):
     from exllamav3.generator import Job
     gen, tokenizer, model_dir = STATE["gen"], STATE["tokenizer"], STATE["model_dir"]
@@ -54,14 +99,34 @@ def generate(messages, max_new, tools=None, stream_cb=None):
               stop_conditions=common.stop_conditions(tokenizer))
     gen.enqueue(job)
     out = []
-    while gen.num_remaining_jobs():
-        for r in gen.iterate():
-            chunk = r.get("text", "")
-            if chunk:
-                out.append(chunk)
-                if stream_cb:
-                    stream_cb(chunk)
-    return "".join(out), ids.shape[-1], getattr(job, "new_tokens", len(out))
+    try:
+        done = False
+        while not done:
+            for r in gen.iterate():
+                if r.get("job") is not job:       # someone else's round, not ours to route
+                    continue
+                chunk = r.get("text", "")
+                if chunk:
+                    out.append(chunk)
+                    if stream_cb:
+                        stream_cb(chunk)
+                err = r.get("error")
+                if err is not None:
+                    raise err
+                if r.get("eos"):
+                    done = True
+                    break
+        return "".join(out), ids.shape[-1], getattr(job, "new_tokens", len(out))
+    except Exception as e:
+        if "out of memory" in str(e).lower():
+            recover()
+            raise OutOfMemory(f"the prompt did not fit in GPU memory ({len(prompt)} chars)") from e
+        raise
+    finally:
+        try:
+            gen.cancel(job)                      # releases pages/state; a no-op once the job has finished
+        except Exception:
+            traceback.print_exc()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -102,8 +167,14 @@ class Handler(BaseHTTPRequestHandler):
         created = int(time.time())
 
         if not req.get("stream"):
-            with LOCK:
-                text, pin, pout = generate(messages, max_new, tools)
+            try:
+                with gpu_slot():
+                    text, pin, pout = generate(messages, max_new, tools)
+            except Busy:
+                return self._json(503, {"error": {"message": "server busy, retry shortly",
+                                                  "type": "server_busy"}})
+            except OutOfMemory as e:
+                return self._json(503, {"error": {"message": str(e), "type": "out_of_memory"}})
             reasoning, answer = common.split_reasoning(text)
             calls, answer = parse_tool_calls(answer, tools)
             msg = {"role": "assistant", "content": answer}
@@ -172,8 +243,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             frame({"role": "assistant", "content": ""})
-            with LOCK:
-                generate(messages, max_new, tools, stream_cb=route)
+            with gpu_slot():
+                text, pin, pout = generate(messages, max_new, tools, stream_cb=route)
             if st["thinking"] and st["buf"].strip():
                 frame({"reasoning_content": st["buf"]})
             if not st["tool"] and st["hold"]:
@@ -186,6 +257,22 @@ class Handler(BaseHTTPRequestHandler):
             for i, c in enumerate(calls):
                 frame({"tool_calls": [{"index": i, **c}]})
             frame({}, finish="tool_calls" if calls else "stop")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except (Busy, OutOfMemory) as e:
+            self._stream_error(cid, created, type(e).__name__, str(e))
+        except Exception as e:
+            traceback.print_exc()
+            self._stream_error(cid, created, type(e).__name__, str(e))
+
+    def _stream_error(self, cid, created, kind, msg):
+        """Headers are already out, so the failure goes down the stream instead of as a status code."""
+        payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                   "model": STATE["alias"], "error": {"message": msg[:500], "type": kind}}
+        try:
+            self.wfile.write(b"data: " + json.dumps(payload).encode() + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
