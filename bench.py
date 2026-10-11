@@ -51,11 +51,19 @@ def main():
         job = Job(input_ids=ids, max_new_tokens=args.ntok, stop_conditions=[])
         gen.enqueue(job)
         t0 = time.time()
+        first = None
         while gen.num_remaining_jobs():
-            gen.iterate()
+            for r in gen.iterate():
+                if r.get("job") is job and r.get("text") and first is None:
+                    first = time.time() - t0
         dt = time.time() - t0
         n = getattr(job, "new_tokens", args.ntok)
-        print(f"{name:5} {n:4d} tokens  {n/dt:6.2f} tok/s   ITL {1000*dt/n:5.1f} ms", flush=True)
+        # Split prefill from decode. They have different bottlenecks -- prefill is a big batch, decode
+        # is one token -- and averaging them into a single tok/s hides which one you are actually waiting on.
+        first = first or 0.0
+        gen_dt = max(dt - first, 1e-6)
+        print(f"{name:5} {n:4d} tokens   prefill {1000 * first:6.0f} ms   "
+              f"{n / gen_dt:6.2f} tok/s   ITL {1000 * gen_dt / n:5.1f} ms", flush=True)
 
     print(f"VRAM at end: {json.dumps(gpu_mem())} MiB", flush=True)
 

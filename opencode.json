@@ -1,0 +1,42 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://host.containers.internal:11435/v1"
+      },
+      "models": {
+        "qwen3.8-opencode": {
+          "name": "Qwen 3.8 27B",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        }
+      }
+    },
+    "flashnext": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Qwen3.8-Flash-Next (8GB, exllamav3)",
+      "options": {
+        "baseURL": "http://host.containers.internal:8080/v1",
+        "timeout": false
+      },
+      "models": {
+        "flash-next": {
+          "name": "Qwen3.8 Flash Next 177B",
+          "limit": { "context": 12288, "output": 4096 }
+        }
+      }
+    }
+  },
+  "permission": {
+    "external_directory": {
+      "/**": "allow"
+    },
+    "lsp": "allow"
+  },
+  "lsp": true
+}
