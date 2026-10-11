@@ -1,5 +1,8 @@
 """Shared loading and prompt helpers for the 8 GB scripts. MIT — Lna-Lab, 2026."""
-import argparse, os
+import argparse, json, os
+
+# FLASH_THINK=0 turns thinking off. Only has an effect if the chat template honours enable_thinking.
+THINK = os.environ.get("FLASH_THINK", "1") != "0"
 
 
 def add_common_args(parser):
@@ -26,22 +29,63 @@ def make_generator(model, cache, tokenizer):
 def _fallback_prompt(messages):
     out = []
     for m in messages:
-        out.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>")
+        out.append(f"<|im_start|>{m['role']}\n{m.get('content') or ''}<|im_end|>")
     out.append("<|im_start|>assistant\n")
     return "\n".join(out)
 
 
-def render_chat(model_dir, messages):
+def _norm_messages(messages):
+    """OpenAI request shape -> template shape: text parts joined, tool arguments as objects."""
+    out = []
+    for m in messages:
+        m = dict(m)
+        c = m.get("content")
+        if isinstance(c, list):                       # typed content parts, e.g. image/text blocks
+            m["content"] = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+        elif c is None:
+            m["content"] = ""
+        if m.get("tool_calls"):
+            tcs = []
+            for tc in m["tool_calls"]:
+                f = dict(tc.get("function", tc))
+                a = f.get("arguments", {})
+                if isinstance(a, str):               # templates want the object, not JSON text
+                    try:
+                        a = json.loads(a or "{}")
+                    except json.JSONDecodeError:
+                        a = {}
+                f["arguments"] = a
+                tcs.append({**tc, "function": f})
+            m["tool_calls"] = tcs
+        out.append(m)
+    return out
+
+
+def render_chat(model_dir, messages, tools=None):
     """Render messages with the model's own chat template when we can, else ChatML."""
+    messages = _norm_messages(messages)
     path = os.path.join(model_dir, "chat_template.jinja")
     if not os.path.exists(path):
         return _fallback_prompt(messages)
     try:
-        from jinja2 import Template
-        tpl = Template(open(path, encoding="utf-8").read())
-        return tpl.render(messages=messages, add_generation_prompt=True)
-    except Exception:
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+
+        def raise_exception(msg):                    # Qwen templates call this on bad tool schemas
+            raise Exception(msg)
+
+        env.globals["raise_exception"] = raise_exception
+        env.filters["tojson"] = lambda x, **kw: json.dumps(
+            x, ensure_ascii=kw.get("ensure_ascii", False), indent=kw.get("indent"),
+            separators=kw.get("separators"), sort_keys=kw.get("sort_keys", False))
+        tpl = env.from_string(open(path, encoding="utf-8").read())
+        return tpl.render(messages=messages, tools=tools or None,
+                          add_generation_prompt=True, enable_thinking=THINK)
+    except Exception as e:
+        # Loudly. A silent ChatML fallback hides the reason the template was unusable.
+        print(f"template render failed ({e}); falling back to plain ChatML", flush=True)
         return _fallback_prompt(messages)
+
 
 
 def stop_conditions(tokenizer):
